@@ -71,7 +71,7 @@ if __name__ == "__main__":
                 divergences.append(div)
                 if len(divergences) >= 5:
                     avg_divergence = np.mean(divergences)
-                    stddev_divergence = np.stddev(divergences)
+                    stddev_divergence = np.std(divergences)
                     diff =  abs(div - avg_divergence) 
                     if diff >=  3 * stddev_divergence:
                         print(f"non randomness detected under a gaussian distribution assumption")
