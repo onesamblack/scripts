@@ -1,4 +1,5 @@
 # found in the LICENSE file.
+# found in the LICENSE file.
 import os
 import argparse
 import re
@@ -8,11 +9,12 @@ import yaml
 import datetime
 import subprocess
 from functools import partial
-from typing import List, Optional
+from typing import List, Optional, Sequence, Union
 
 from chromite.lib import commandline
 from chromite.lib import portage_util
 from chromite.lib import cros_build_lib
+
 # repos for ebuild files
 CHROMIUMOS_OVERLAY = (
     "/home/chrome/chromiumos/src/third_party/chromiumos-overlay"
@@ -33,7 +35,18 @@ OUTPUT = {"package": "", "modified": [], "failed": []}
     - 
 """
 TASKS = []
-
+# patterns for parsing the ebuild
+patterns = {}
+patterns["start_declaration"]=re.compile("[\w\d\-\_]+\+?=\"")
+patterns["start_quote"]=re.compile("\"\s*")
+patterns["end_quote"]=re.compile(r'.*"')
+patterns["depend"]=re.compile("(B|C|R|COMMON_)?DEPEND\+?=\"")
+patterns["flag"]=re.compile("\!?\+?\-?[\w\d\-_]+\??")
+patterns["use"]=re.compile("(I|COMMON_)?USE\+?=")
+patterns["toggleable_flag"]=re.compile("[\w\d\-_]+\?")
+patterns["var"]=re.compile("\$\{[\w\d\-\._]+\}")
+patterns["package"]=re.compile("((>=)?[\w\d\.\-]+/?[\w\d\.-]+(:=)?)")
+patterns["comment"]=re.compile("#.*?$")
 
 def zprint(s: str, debug: bool = False):
     if all([DEBUG, debug]):
@@ -45,10 +58,14 @@ def zprint(s: str, debug: bool = False):
 def get_parser() -> commandline.ArgumentParser:
     """Build the argument parser."""
     parser = commandline.ArgumentParser(description=__doc__)
-    
+
     parser.add_argument("-p", "--package", help="Package.", required=True)
-    parser.add_argument("--vbose",action="store_true", help="debug logging", default=False)
-    parser.add_argument("-o", "--output", type="path", help="output file", required=True)
+    parser.add_argument(
+        "--vbose", action="store_true", help="debug logging", default=False
+    )
+    parser.add_argument(
+        "-o", "--output", type="path", help="output file", required=True
+    )
     parser.add_argument("--sysroot", type="path", help="Sysroot path.")
     return parser
 
@@ -68,16 +85,11 @@ def run_subprocess(cmd: str) -> str:
         the result of the subprocess
     """
     zprint(cmd, True)
-    res = subprocess.run(
-        cmd, shell=True, stdout=subprocess.STDOUT, stderr=subprocess.PI{PE
-    )
-    if res.returncode == 0:
-        return res.stdout.decode("utf-8")
-    else:
-        raise Exception(
-            f"a subprocess returned a non-zero exit code: {res.returncode}, error: {res.stdout.decode('utf-8')}"
-        )
-
+    res=None
+    res = cros_build_lib.run(cmd, shell=True, capture_output=True, encoding="utf-8")
+    if res:
+        return res.stdout
+    return res
 
 def prompt_yn(prompt):
     while True:
@@ -116,197 +128,66 @@ def write_temporary_file(file_):
         os.remove(temp)
     except:
         raise
-import re
-from typing import Sequence, Union
 
-def cr(parts:Sequence=[], 
-       group:Union(bool,str)="", 
-       is_set:bool=False,
-       zom:bool=False,
-       oom:bool=False,
-       optional:bool=False,
-       compile:bool=False)->str:
-    """
-    convenience for building a `complex` regex string
-    each part is a 2-tuple:
-      (operation, content)
-    where operation is one of
-        ''              : append as is
-        'g:<name>'      : group as a named group (?P<..>)
-        'g'             : group without naming ()
-        's'             : wrap the part in a set []
-        'e'             : escape each char in the sequence and append
-        "*"             : is zero or more
-        "+"             : is one or more
-        "?"             : is optional
 
-        operator precedence is:
-        e s g(named or unnamed) *+?
+def read_content(filepath):
+    content=""
+    with open(filepath,'r') as fh:
+        content+=fh.read()
+    return content
+
+def strip_ver_rev(package):
+    p=re.sub("(\-[\d\.]+)*?(\-r[0-9]+)?$","",package)
+    return p.replace(" ","")
+
+def tokenize(string):
+    tokens=string.replace("\n","").replace("\""," ").split(" ")
+    tokens=[x for x in tokens if x != '']
+    return tokens
+
+class UseFlag:
+    def __init__(self, flag):
+        self.flag=re.sub("[+-]","",flag)
+        flag=list(flag)
+        self.enabled=True if flag[0]=="+" else False
+        self.disabled=True if flag[0]=="-" else False
+        self.default=True if not any([self.enabled, self.disabled]) else False
+        self.toggle=False
+
+    def __str__(self):
+        flag=f"{self.flag}"
+        if self.toggle:
+            flag=f"{flag}?"
+        if self.enabled:
+            flag=f"+{flag}"
+        if self.disabled:
+            flag=f"-{flag}"
+        return flag
         
-        example, if the operation is:
-        'e,s,g,?', and the string is 'foo?', the output will be
-        '([foo\?])?'
-    
-    each 'part' is processed, then added to the output string. It's recommended to
-    limit the use of named groups in the inner operations.
+    def can_toggle(self):
+        """
+        a UseFlag is only toggleable in the context of the package in which it's declared.
+        e.g. a flag in package X can be optional, but in Y can be required
 
-    ```cr``` also has top level operations, which apply to the whole
-    regular expression, in the same operator precendence as above
-    
-    Args: 
-        parts       : as defined above
-        group       : (bool, str) if bool, create an unnamed group, if str, create a
-                  named group
-        is_set      : if True, wrap the regular expression in a set []
-        zom         : if True, append a *
-        oom         : if True, append a +
-        optional    : if True, append a ?
-        compile     : if True, compile the expression before returning
-
-    this function may seem like overkill, but it's useful when reusing 
-    multiple expressions within expressions, as the output of `cr` can be used 
-    as a part in another higher level regular expression
-
-    if you've ever worked on very long regular expressions, you can most
-    likely attest to the amazing amount of frustration caused by
-    unmatched parentheses or a misplaced */? breaking the entire sequence.
-
-    example
-
-    patterns = {}
-
-    patterns["example1"] = cr(
-        [
-            # moderately complex 
-            (),
-            (),
-            ()
-        ]
-    )
-
-    patterns["example2"] = cr(
-        [
-
-            # more complex
-            ("?", patterns["example1"])
-            (),
-            (),
-            (),
-            ..
-        ],
-        group="mycomplexregex"
-    )
-    """
-    r_string=""
-    option_priority={
-        's'        : 100,
-        'g'        : 200,
-        'e'        : 300,
-        'g:.+'     : 400,
-        '(\*|\+)'  : 500,
-        '\?'       : 600
-    }
-    def _op(o):
-        for k,v in option_priority.items():
-            if re.match(k, o):
-                return v
-    def _group(name="", r_string=""):
-        _ = "" 
-        if name:
-            _=f"(?P<{name}>{r_string})"
-        else:
-            _+=f"({r_string})"
-        return _
-
-    def options_(option_string):
-        options=option_string.split(",")
-        if len(options)==1 and options[0]=="":
-            options=None
-            return options
-        else:
-            return sorted(options, key=_op)
-    
-    for p in parts:
-        # begin processing all parts
-        s_string=""
-        options=options_(p[0])
-        if not options:
-            if type(p[1])==str:
-                s_string=p[1]
-            elif type(p[1])==list:
-                s_string="".join([x for x in p[1]])
-            r_string+=s_string
-            next
-        else    :   
-            """
-            precendence of operations
-            e s g, *+?
-            """
-            # first, compress the string and escape it
-            if 'e' in options:
-                if type(p[1])==str: 
-                    s_string+=re.escape(p[1])
-                elif type(p[1])==list:
-                    s_string+=re.escape("".join(x for x in p[1]))
-                    del options[options.index("e")]
-            else:
-                if type(p[1])==str: 
-                    s_string+=p[1]
-                elif type(p[1])==list:
-                    s_string+="".join(x for x in p[1])
-            for o in options:
-                if o=="s":
-                    s_string=f"[{s_string}]"
-                if o=="g":
-                    s_string=_group(name="", r_string=s_string)
-                if re.match("g:.+",o):
-                    name = o.split(":")[1]
-                    s_string=_group(name=name, r_string=s_string)
-                if o in ["*", "+"]:
-                    s_string=f"{s_string}{o}"
-        # end parts - Append the 'part'
-            r_string+=s_string
-    if is_set:
-            r_string=f"[{r_string}]"    
-    if group:
-        if type(group)==bool:
-            r_string=_group("", r_string)
-        elif type(group)==str:
-            r_string=_group(group, r_string)
-    if zom:
-        r_string=f"{r_string}*"
-    if oom:
-        r_string=f"{r_string}+"
-    if optional:
-        r_string=f"{r_string}?"
-    if compile:
-        return re.compile(r_string)
-    else: 
-        return r_string
-
-
-patterns = {} 
-
-
-patterns["use"]=cr([
-        ("","(REQUIRED_|I)?USE="),
-        ("","\""),
-        ("es*","-+"),
-        ("esg", "A-Za-z0-9-+_"),
-
-
-    ],
-    group="use")
+        Thus, UseFlag objects can only be used in the context of a package, and not individually
+        as singletons
+        """
+        self.toggle=True
+        
+    def match(self,string):
+        if re.match(string, self.flag):
+            return True
 
 class Package:
+    p_use=re.compile("(I|REQUIRED_)?USE")
+    p_depend=re.compile("(B|C|R|COMMON_)?DEPEND")
+    def __init__(self, name, filepath=None):
+        self.name = name
+        self.filepath=filepath if filepath else equery_which(name)
+        self.dependencies=[]
+        self.useflags=[]
+        self._parse_ebuild()
 
-    _use_pattern=cr()
-    _dependency_pattern=cr()
-    def __init__(self, name):
-        self.name=name
-        self.dependencies=None
-        self.useflags=None
-        self.filepath=None
     def _parse_ebuild(self):
         """
         parses an ebuild file - adds all dependencies
@@ -317,32 +198,100 @@ class Package:
         rather than use the built in `equery` tool, this reads the content directly and uses
         regex to parse the pattern
         """
-        pass
-
-    def _getmetadata(self):
-        self.filepath=equery_which(self.name)
-
-    def _get_dependencies(self):
+        ebuild=read_content(self.filepath).replace("\t"," ").split("\n")
+        metadata={}
+        for i in range(0, len(ebuild)):
+            # filter comments
+            line=patterns["comment"].sub("",ebuild[i])
+            match_sd=patterns["start_declaration"].search(line)
+            if match_sd:
+                declaration=match_sd.group(0).replace("=\"",'')
+                s_idx=i
+                e_idx=i
+                content=patterns["start_declaration"].sub("",line)
+                match_end=patterns["end_quote"].match(content)
+                while not match_end:
+                    e_idx+=1
+                    match_end=patterns["end_quote"].match(ebuild[e_idx])
+                    content+=ebuild[e_idx]
+                if Package.p_depend.match(declaration):
+                    self._set_dependencies(tokenize(content))
+                elif Package.p_use.match(declaration):
+                    self._set_useflags(tokenize(content))
+                metadata[declaration]=content
+        for k,v in metadata.items():
+            setattr(self, k, v)
+    def _set_dependencies(self, tokens):
         """
-        returns a list of tuples
-        
+        sets dependencies
+
         where t[0] is the use flag if the dependency can be toggled in the ebuild, else None
         and t[1] is the dependency
         """
-        pass
 
-
-
-    def _get_useflags(self, enabled_only=False):
-        """
-        if enabled_only, returns only toggled useflags
-        """
-        pass
-
-        
+        def strip_version(dependency):
+            d=re.sub("\:\=.*?$","",dependency)
+            d=re.sub("^\>\=","",d)
+            return d
+        dependencies=[]
+        i=0
+        while i < len(tokens):
+            if patterns["package"].match(tokens[i]):
+                # the token is a non-toggleable dependency
+                dep=strip_version(tokens[i])
+                dependencies.append((None, dep))
+            elif patterns["toggleable_flag"].match(tokens[i]):
+                # iterate through until the end of the matches
+                # assume\s the next token is (, followed by the package[s]
+                # then a ) to end the dequence
+                flag=tokens[i].replace("?","")
+                i=i+2
+                token=tokens[i]
+                while token != ")":
+                    dep=strip_version(token)
+                    dependencies.append((flag, dep))
+                    for _u in self.useflags:
+                        if _u.match(flag):
+                            _u.can_toggle()
+                    i+=1
+                    token=tokens[i]
+            i+=1                       
+        self.dependencies.extend(dependencies)
+    def _add_useflag(self, useflag):
+        if not useflag.flag in [x.flag for x in self.useflags]:
+            self.useflags.append(useflag)
+    def _set_useflags(self, tokens):
+        def is_flag(token):
+            match = patterns["flag"].match(token)
+            if match:
+                return True
+        useflags=[]
+        i=0
+        while i < len(tokens):
+            if is_flag(tokens[i]):
+                flag=UseFlag(tokens[i])
+                useflags.append(flag)
+            elif tokens[i] == "(":
+                i+=1
+                token=tokens[i]
+                while token != ")":
+                    if is_flag(token):
+                        flag=UseFlag(token)
+                        useflags.append(flag)
+                    i+=1
+                    token=tokens[i]
+            i+=1
+        for f in useflags:
+            self._add_useflag(f)
+                   
+    def can_toggle_dependency(self,dependency):
+        for d in self.dependencies:
+            if d[1] == dependency:
+                return d[0]
+                
 
 def equery_use(package, options=[]):
-    option_string = "-o -F '$cp:$name:$fullversion:$repo"
+    option_string = "-o"
     packages = []
     if options:
         option_string += " ".join([o for o in options])
@@ -363,8 +312,24 @@ def equery_which(package, options=[]):
         option_string += " ".join([o for o in options])
     cmd = f"equery -C which {package} {option_string}"
     res = run_subprocess(cmd)
+    if res:
+        res=res.replace("\n","")
     return res
 
+def equery_depends(package, options=[]):
+    option_string = ""
+    if options:
+        option_string += " ".join([o for o in options])
+    cmd = f"equery depends -a  {package} {option_string}"
+    res = run_subprocess(cmd)
+    if res:
+        deps=set()
+        for x in [strip_ver_rev(x) for x in res.split("\n")]:
+            print(f"dep:{x}")
+            if x != '':
+                deps.add(x)
+        return deps
+    return res
 
 
 def get_dependencies_with_use_flags(dependency_string):
@@ -592,20 +557,10 @@ def main(argv: Optional[List[str]]) -> Optional[int]:
     parser = get_parser()
     opts = parser.parse_args(argv)
     if opts.verbose:
-        DEBUG=True
+        DEBUG = True
     output_file = opts.output
-    failed_packages = try_remove_package(opts.package)
-    run_tasks()
-    if failed_packages:
-        for f in failed_packages:
-            OUTPUT["failed"].append(
-                {"package": f, "ebuild_path": equery_which(f)}
-            )
+    deps=equery_depends(opts.package)
+    for d in deps:
+        rev_dep=Package(d)
+        print([str(x) for x in rev_dep.useflags])
 
-    # write output
-    now = datetime.datetime.now()
-    formatted_date = now.strftime("%Y-%m-%d %H:%M:%S")
-    with open(os.path.abspath(output_file), "w") as out_fh:
-        out_fh.write(f"# removal log for {opts.package}")
-        out_fh.write(f"# generated on {formatted_date}")
-        out_fh.write(yaml.dumps(OUTPUT))
