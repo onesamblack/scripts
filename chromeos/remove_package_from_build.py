@@ -1,6 +1,5 @@
-# found in the LICENSE file.
-# found in the LICENSE file.
 import os
+import sys
 import argparse
 import re
 import atexit
@@ -8,6 +7,9 @@ import signal
 import yaml
 import datetime
 import subprocess
+import pprint
+import jinja2
+from string import Template
 from functools import partial
 from typing import List, Optional, Sequence, Union
 
@@ -15,6 +17,7 @@ from chromite.lib import commandline
 from chromite.lib import portage_util
 from chromite.lib import cros_build_lib
 
+pprint = pprint.PrettyPrinter()
 # repos for ebuild files
 CHROMIUMOS_OVERLAY = (
     "/home/chrome/chromiumos/src/third_party/chromiumos-overlay"
@@ -28,25 +31,44 @@ CLEAN = False
 # each entry to modified/failed is
 # {"package": "net-libs/etc", "path": "full/path/to/ebuild"}
 # if modified, add "use_flag": "flag"
-OUTPUT = {"package": "", "modified": [], "failed": []}
-"""
-# tasks is a list of sequential tasks to perform as a result of the remove_package process
-    - add_use_mask
-    - 
-"""
-TASKS = []
 # patterns for parsing the ebuild
 patterns = {}
-patterns["start_declaration"]=re.compile("[\w\d\-\_]+\+?=\"")
-patterns["start_quote"]=re.compile("\"\s*")
-patterns["end_quote"]=re.compile(r'.*"')
-patterns["depend"]=re.compile("(B|C|R|COMMON_)?DEPEND\+?=\"")
-patterns["flag"]=re.compile("\!?\+?\-?[\w\d\-_]+\??")
-patterns["use"]=re.compile("(I|COMMON_)?USE\+?=")
-patterns["toggleable_flag"]=re.compile("[\w\d\-_]+\?")
-patterns["var"]=re.compile("\$\{[\w\d\-\._]+\}")
-patterns["package"]=re.compile("((>=)?[\w\d\.\-]+/?[\w\d\.-]+(:=)?)")
-patterns["comment"]=re.compile("#.*?$")
+patterns["start_declaration"] = re.compile('[\w\d\-\_]+\+?="')
+patterns["start_quote"] = re.compile('"\s*')
+patterns["end_quote"] = re.compile(r'.*"')
+patterns["depend"] = re.compile('\w*?DEPEND\+?="')
+patterns["flag"] = re.compile("\!?\+?\-?[\w\d\-_]+\??")
+patterns["use"] = re.compile("(I|COMMON_)?USE\+?=")
+patterns["toggleable_flag"] = re.compile("[\w\d\-_]+\?")
+patterns["var"] = re.compile("\$\{[\w\d\-\._]+\}")
+patterns["package"] = re.compile("((>=)?[\w\d\.\-]+//?[\w\d\.-]+(:=)?)")
+patterns["comment"] = re.compile("#.*?$")
+patterns["virtual"] = re.compile("virtual//.+")
+patterns["inclusive_or"] = re.compile(re.escape("||"))
+patterns["exclusive_or"] = re.compile(re.escape("^^"))
+patterns["at_most"] = re.compile(re.escape("??"))
+
+report = jinja2.Template("""
+attempting to remove: {[ original_package }}
+
+The following atoms will be added to `package.mask`
+{% for p in package_masks %}
+  - {{ p  }}
+{% endfor %}
+
+The following atoms will be added to package.use.mask`
+{% for p in package_use_masks %}
+  - {{ p[0] }} {{ p[1] }}
+{% endfor %}
+
+The following packages cannot be removed automatically:
+{% for p in nonoptional_dependencies %}
+  - {{ p }}
+{% endfor %}
+
+"""
+)
+
 
 def zprint(s: str, debug: bool = False):
     if all([DEBUG, debug]):
@@ -62,9 +84,6 @@ def get_parser() -> commandline.ArgumentParser:
     parser.add_argument("-p", "--package", help="Package.", required=True)
     parser.add_argument(
         "--vbose", action="store_true", help="debug logging", default=False
-    )
-    parser.add_argument(
-        "-o", "--output", type="path", help="output file", required=True
     )
     parser.add_argument("--sysroot", type="path", help="Sysroot path.")
     return parser
@@ -85,11 +104,14 @@ def run_subprocess(cmd: str) -> str:
         the result of the subprocess
     """
     zprint(cmd, True)
-    res=None
-    res = cros_build_lib.run(cmd, shell=True, capture_output=True, encoding="utf-8")
+    res = None
+    res = cros_build_lib.run(
+        cmd, shell=True, capture_output=True, encoding="utf-8"
+    )
     if res:
         return res.stdout
     return res
+
 
 def prompt_yn(prompt):
     while True:
@@ -131,229 +153,30 @@ def write_temporary_file(file_):
 
 
 def read_content(filepath):
-    content=""
-    with open(filepath,'r') as fh:
-        content+=fh.read()
+    content = ""
+    with open(filepath, "r") as fh:
+        content += fh.read()
     return content
 
+
 def strip_ver_rev(package):
-    p=re.sub("(\-[\d\.]+)*?(\-r[0-9]+)?$","",package)
-    return p.replace(" ","")
+    p = re.sub("\-[\d\.]+\-?_?r?c?p?[0-9A-Za-z]*$", "", package)
+    return p.replace(" ", "")
+def strip_version(dependency):
+    d = re.sub("\:\=?.*?$", "", dependency)
+    d = re.sub("^\>\=", "", d)
+    d = d.replace(" ","")
+    return d
+def strip_qualifiers(flag):
+    f=flag.replace("!","").replace("?","")
+    return f
+
+
 
 def tokenize(string):
-    tokens=string.replace("\n","").replace("\""," ").split(" ")
-    tokens=[x for x in tokens if x != '']
+    tokens = string.replace("\n", "").replace('"', " ").split(" ")
+    tokens = [x for x in tokens if x != ""]
     return tokens
-
-class UseFlag:
-    def __init__(self, flag):
-        self.flag=re.sub("[+-]","",flag)
-        flag=list(flag)
-        self.enabled=True if flag[0]=="+" else False
-        self.disabled=True if flag[0]=="-" else False
-        self.default=True if not any([self.enabled, self.disabled]) else False
-        self.toggle=False
-
-    def __str__(self):
-        flag=f"{self.flag}"
-        if self.toggle:
-            flag=f"{flag}?"
-        if self.enabled:
-            flag=f"+{flag}"
-        if self.disabled:
-            flag=f"-{flag}"
-        return flag
-        
-    def can_toggle(self):
-        """
-        a UseFlag is only toggleable in the context of the package in which it's declared.
-        e.g. a flag in package X can be optional, but in Y can be required
-
-        Thus, UseFlag objects can only be used in the context of a package, and not individually
-        as singletons
-        """
-        self.toggle=True
-        
-    def match(self,string):
-        if re.match(string, self.flag):
-            return True
-
-class Package:
-    p_use=re.compile("(I|REQUIRED_)?USE")
-    p_depend=re.compile("(B|C|R|COMMON_)?DEPEND")
-    def __init__(self, name, filepath=None):
-        self.name = name
-        self.filepath=filepath if filepath else equery_which(name)
-        self.dependencies=[]
-        self.useflags=[]
-        self._parse_ebuild()
-
-    def _parse_ebuild(self):
-        """
-        parses an ebuild file - adds all dependencies
-        to `self.dependencies`
-
-        adds all useflags to `self.useflags`
-
-        rather than use the built in `equery` tool, this reads the content directly and uses
-        regex to parse the pattern
-        """
-        ebuild=read_content(self.filepath).replace("\t"," ").split("\n")
-        metadata={}
-        for i in range(0, len(ebuild)):
-            # filter comments
-            line=patterns["comment"].sub("",ebuild[i])
-            match_sd=patterns["start_declaration"].search(line)
-            if match_sd:
-                declaration=match_sd.group(0).replace("=\"",'')
-                s_idx=i
-                e_idx=i
-                content=patterns["start_declaration"].sub("",line)
-                match_end=patterns["end_quote"].match(content)
-                while not match_end:
-                    e_idx+=1
-                    match_end=patterns["end_quote"].match(ebuild[e_idx])
-                    content+=ebuild[e_idx]
-                if Package.p_depend.match(declaration):
-                    self._set_dependencies(tokenize(content))
-                elif Package.p_use.match(declaration):
-                    self._set_useflags(tokenize(content))
-                metadata[declaration]=content
-        for k,v in metadata.items():
-            setattr(self, k, v)
-    def _set_dependencies(self, tokens):
-        """
-        sets dependencies
-
-        where t[0] is the use flag if the dependency can be toggled in the ebuild, else None
-        and t[1] is the dependency
-        """
-
-        def strip_version(dependency):
-            d=re.sub("\:\=.*?$","",dependency)
-            d=re.sub("^\>\=","",d)
-            return d
-        dependencies=[]
-        i=0
-        while i < len(tokens):
-            if patterns["package"].match(tokens[i]):
-                # the token is a non-toggleable dependency
-                dep=strip_version(tokens[i])
-                dependencies.append((None, dep))
-            elif patterns["toggleable_flag"].match(tokens[i]):
-                # iterate through until the end of the matches
-                # assume\s the next token is (, followed by the package[s]
-                # then a ) to end the dequence
-                flag=tokens[i].replace("?","")
-                i=i+2
-                token=tokens[i]
-                while token != ")":
-                    dep=strip_version(token)
-                    dependencies.append((flag, dep))
-                    for _u in self.useflags:
-                        if _u.match(flag):
-                            _u.can_toggle()
-                    i+=1
-                    token=tokens[i]
-            i+=1                       
-        self.dependencies.extend(dependencies)
-    def _add_useflag(self, useflag):
-        if not useflag.flag in [x.flag for x in self.useflags]:
-            self.useflags.append(useflag)
-    def _set_useflags(self, tokens):
-        def is_flag(token):
-            match = patterns["flag"].match(token)
-            if match:
-                return True
-        useflags=[]
-        i=0
-        while i < len(tokens):
-            if is_flag(tokens[i]):
-                flag=UseFlag(tokens[i])
-                useflags.append(flag)
-            elif tokens[i] == "(":
-                i+=1
-                token=tokens[i]
-                while token != ")":
-                    if is_flag(token):
-                        flag=UseFlag(token)
-                        useflags.append(flag)
-                    i+=1
-                    token=tokens[i]
-            i+=1
-        for f in useflags:
-            self._add_useflag(f)
-                   
-    def can_toggle_dependency(self,dependency):
-        for d in self.dependencies:
-            if d[1] == dependency:
-                return d[0]
-                
-
-def equery_use(package, options=[]):
-    option_string = "-o"
-    packages = []
-    if options:
-        option_string += " ".join([o for o in options])
-    cmd = f"equery hasuse {package} {option_string}"
-    res = run_subprocess(cmd)
-    if res:
-        for l in res.split("\n"):
-            # each return line is formatted as shown below
-            # chromeos-base/chrome-icu:chrome-icu:9999:chromiumos
-            package, name, version, repo = l.split(":")
-            packages.append((package, name, version, repo))
-    return packages
-
-
-def equery_which(package, options=[]):
-    option_string = ""
-    if options:
-        option_string += " ".join([o for o in options])
-    cmd = f"equery -C which {package} {option_string}"
-    res = run_subprocess(cmd)
-    if res:
-        res=res.replace("\n","")
-    return res
-
-def equery_depends(package, options=[]):
-    option_string = ""
-    if options:
-        option_string += " ".join([o for o in options])
-    cmd = f"equery depends -a  {package} {option_string}"
-    res = run_subprocess(cmd)
-    if res:
-        deps=set()
-        for x in [strip_ver_rev(x) for x in res.split("\n")]:
-            print(f"dep:{x}")
-            if x != '':
-                deps.add(x)
-        return deps
-    return res
-
-
-def get_dependencies_with_use_flags(dependency_string):
-    """
-    the output from ```equery_depends``` is a string for each
-    dependency formatted as follows:
-        net-fs/samba-4.16.8-r2 (cups ? net-print/cups)
-        net-print/cups-filters-1.28.17 (>=net-print/cups-1.7.3)
-    returns a list of tuples[2] if the dependency is optional (controlled by a USE flag, else False
-    """
-    dependencies = []
-    dep = re.compile("(?P<dep>\([\s\?\>\<=\._\-A-Za-z0-9/\[\]]+\))")
-    useflag = re.compile(
-        "\((?P<use>[a-zA-Z_\-0-9]+\s\?)?\s?(?P<dep>[a-zA-Z0-9\-\_\<\>=/\.\:\[\]]+)\)"
-    )
-    for d in dep.finditer(dependency_string):
-        full_dependency = d.group("dep")
-        use_match = useflag.match(full_dependency)
-        if use_match:
-            use = use_match.group("use")
-            dependency = use_match.group("dep")
-            dependencies.append((use, dependency))
-
-    return dependencies
 
 
 def add_package_mask(package, version=""):
@@ -367,7 +190,7 @@ def add_package_mask(package, version=""):
     res = run_subprocess(cmd)
     if res:
         zprint(
-            f"not adding the package: {package} to packages.mask,  it already exists",
+            f"not adding the package: {package} to package.mask,  it already exists",
             debug=True,
         )
         return
@@ -378,7 +201,6 @@ def add_package_mask(package, version=""):
             package_string += f":{version}"
         cmd = f"echo {package_string} >> {fh}"
     run_subcommand(cmd)
-    OUTPUT["masked"] = True
 
 
 def add_package_use_mask(package, use_flag, version=""):
@@ -404,13 +226,6 @@ def add_package_use_mask(package, use_flag, version=""):
             new = orig + f"{use_flag}"
             cmd = f"sed s/orig/{new}/g {fh}"
             run_subprocess(cmd)
-            OUTPUT["modified"].append(
-                {
-                    "package": package,
-                    "ebuild_path": ebuild_path,
-                    "use_flag": use_flag,
-                }
-            )
         else:
             zprint(
                 f"not adding to the existing mask - add this mask manually",
@@ -436,118 +251,439 @@ def add_package_use_mask(package, use_flag, version=""):
     )
 
 
+class Task:
+    def __init__(self, task,  **kwargs):
+        self.task = task
+        self.kwargs = kwargs
+
+    def run_task(self):
+        if self.task == "pm":
+            add_package_mask(self.kwargs["package"])
+        if self.task == "pum":
+            add_package_use_mask(self.kwargs["package"], self.kwargs["useflag"])
+        if self.task == "mtf":
+            make_temporary_file(self.kwargs["file_"])
+        if self.task == "wtf":
+            write_temporary_file(self.kwargs["file_"])
+
+
+class UseFlag:
+    def __init__(self, flag):
+        self.flag = re.sub("[+-]", "", flag)
+        flag = list(flag)
+        self.enabled = True if flag[0] == "+" else False
+        self.disabled = True if flag[0] == "-" else False
+        self.default = True if not any([self.enabled, self.disabled]) else False
+        self.toggle = False
+
+    def __str__(self):
+        flag = f"{self.flag}"
+        if self.toggle:
+            flag = f"{flag}?"
+        if self.enabled:
+            flag = f"+{flag}"
+        if self.disabled:
+            flag = f"-{flag}"
+        return flag
+
+    def can_toggle(self):
+        """
+        a UseFlag is only toggleable in the context of the package in which it's declared.
+        e.g. a flag in package X can be optional, but in Y can be required
+
+        Thus, UseFlag objects can only be used in the context of a package, and not individually
+        as singletons
+        """
+        self.toggle = True
+
+    def match(self, string):
+        if re.match(string, self.flag):
+            return True
+
+
+class Package:
+    p_use = re.compile("(I|REQUIRED_)?USE")
+    p_depend = re.compile("(B|C|R|P|COMMON_|[\w_\-]+_)?*DEPEND")
+
+    def __init__(self, name, filepath=None):
+        self.name = name
+        self.filepath = filepath if filepath else equery_which(name)
+        self.dependencies = []
+        self.useflags = []
+        self._parse_ebuild()
+    
+    def print_ebuild(self):
+        content=read_content(self.filepath)
+        print(content)
+
+    def get_use_flags(self):
+        return [str(x) for x in self.useflags]
+    def _parse_ebuild(self):
+        """
+        parses an ebuild file - adds all dependencies
+        to `self.dependencies`
+
+        adds all useflags to `self.useflags`
+
+        rather than use the built in `equery` tool, this reads the content directly and uses
+        regex to parse the pattern
+        """
+        ebuild = read_content(self.filepath).replace("\t", " ").split("\n")
+        metadata = {}
+        for i in range(0, len(ebuild)):
+            # filter comments
+            line = patterns["comment"].sub("", ebuild[i])
+            match_sd = patterns["start_declaration"].search(line)
+            if match_sd:
+                declaration = match_sd.group(0).replace('="', "").replace("+","")
+                s_idx = i
+                e_idx = i
+                content = patterns["start_declaration"].sub("", line)
+                match_end = patterns["end_quote"].match(content)
+                while not match_end:
+                    e_idx += 1
+                    content += ebuild[e_idx]
+                    match_end = patterns["end_quote"].match(ebuild[e_idx])
+                
+                if Package.p_depend.match(declaration):
+                    self._set_dependencies(tokenize(content))
+                
+                elif Package.p_use.match(declaration):
+                    self._set_useflags(tokenize(content))
+                metadata[declaration] = content
+        for k, v in metadata.items():
+            if k in dir(self):
+                attr=getattr(self,k)
+                attr+=v
+                setattr(self,k,v)
+            else:
+                setattr(self, k, v)
+        self.metadata=metadata
+
+    def _add_dependency(self, d):
+        if d[1] not in [x[1] for x in self.dependencies]:
+            self.dependencies.append(d)
+    def _set_dependencies(self, tokens):
+        """
+        sets dependencies
+
+        where t[0] is the use flag if the dependency can be toggled in the ebuild, else None
+        and t[1] is the dependency
+        """
+
+        dependencies = []
+        i = 0
+        while i < len(tokens):
+            token=tokens[i]
+            if patterns["atom"].match(token):
+                # the token is a non-toggleable dependency
+                dep = strip_version(strip_ver_rev(token))
+                dependencies.append((None, dep))
+            elif patterns["inclusive_or"].match(tokens[i]):
+                token=tokens[i]
+                while token != "(":
+                    i+=1
+                    token=tokens[i]
+                while token != ")":
+                    i+=1
+                    token=tokens[i]
+                    if patterns["atom"].match(tokens[i]):
+                        dependencies.append((None,tokens[i]))
+             elif patterns["exclusive_or"].match(tokens[i]):
+                token=tokens[i]
+                while token != "(":
+                    i+=1
+                    token=tokens[i]
+                while token != ")":
+                    i+=1
+                    token=tokens[i]
+                    if patterns["atom"].match(tokens[i]):
+                        dependencies.append((None,tokens[i]))
+             elif patterns["at_most"].match(tokens[i]):
+                token=tokens[i]
+                while token != "(":
+                    i+=1
+                    token=tokens[i]
+                while token != ")":
+                    i+=1
+                    token=tokens[i]
+                    if patterns["atom"].match(tokens[i]):
+                        dependencies.append((None,tokens[i]))
+            elif patterns["flag"].match(token):
+                # a flag can be declared with or without parenthesis
+                # e.g. cups? ( net-lib/wireless ) OR
+                # !cups? !package/my-atom:2
+                flag = strip_qualifiers(token)
+                has_paren=True if tokens[i+1] == "(" else False
+                if has_paren:
+                    while token != ")":
+                        i+=1
+                        token=tokens[i]
+                        if patterns["atom"].match(token):
+                            dep = strip_version(strip_ver_rev(token))
+                            dependencies.append((flag, dep))
+                        
+                    for _u in self.useflags:
+                        if _u.match(flag):
+                            _u.can_toggle()
+                    i += 1
+                    try:
+                        token = tokens[i]
+                    except:
+                        print(f"token out of range: i: {i}")
+                        print(tokens[i-1])
+                        break
+            i += 1
+        for d in dependencies:
+            self._add_dependency(d)
+
+    def _add_useflag(self, useflag):
+        if not useflag.flag in [x.flag for x in self.useflags]:
+            self.useflags.append(useflag)
+
+    def _set_useflags(self, tokens):
+        def is_flag(token):
+            match = patterns["flag"].match(token)
+            if match:
+                return True
+
+        useflags = []
+        i = 0
+        while i < len(tokens):
+            token=tokens[i]
+            if is_flag(tokens[i]):
+                flag = UseFlag(tokens[i])
+                useflags.append(flag)
+            elif tokens[i] == "(":
+                i += 1
+                token = tokens[i]
+                while token != ")":
+                    if is_flag(token):
+                        flag = UseFlag(token)
+                        useflags.append(flag)
+                    i += 1
+                    token = tokens[i]
+            i += 1
+        for f in useflags:
+            self._add_useflag(f)
+
+    def can_toggle_dependency(self, dependency):
+        for d in self.dependencies:
+            if strip_version(strip_ver_rev(d[1])) == strip_ver_rev(dependency):
+                return d[0]
+
+
+def equery_use(package, options=[]):
+    option_string = "-o"
+    packages = []
+    if options:
+        option_string += " ".join([o for o in options])
+    cmd = f"equery hasuse {package} {option_string}"
+    res = run_subprocess(cmd)
+    if res:
+        for l in res.split("\n"):
+            # each return line is formatted as shown below
+            # chromeos-base/chrome-icu:chrome-icu:9999:chromiumos
+            package, name, version, repo = l.split(":")
+            packages.append((package, name, version, repo))
+    return packages
+
+
+def equery_which(package, options=[]):
+    option_string = ""
+    if options:
+        option_string += " ".join([o for o in options])
+    cmd = f"equery -C which {package} {option_string}"
+    res = run_subprocess(cmd)
+    if res:
+        res = res.replace("\n", "")
+    return res
+
+
+def equery_depends(package, options=[]):
+    option_string = ""
+    if options:
+        option_string += " ".join([o for o in options])
+    cmd = f"equery depends -a  {package} {option_string}"
+    res = None
+    try:
+        res = run_subprocess(cmd)
+    except cros_build_lib.RunCommandError:
+        zprint(f"the package:{package} has no dependencies")
+
+    if res:
+        deps = set()
+        for x in [strip_ver_rev(x) for x in res.split("\n")]:
+            if x != "":
+                deps.add(x)
+        return deps
+    return res
+
+
 def try_remove_package(package):
     """
     tries to remove a package from the build via the following steps
         run ```equery_depends``` to collect all the 'upstream' dependencies
-        each dependency is serialized into a ``Dependency``, which contains all use flags and other metadata
+        each dependency is serialized into a `Package``, which contains all use flags and other metadata
         for each upstream dependency:
-            check to see if the dependency is controlled by a use flag by running is_optional_dependency
-            if is_optional:
-                add the use flag and upstream packages to the package_use_mask list
+            check to see if the dependency is controlled by a use flag by running is_toggleable_dependency
+            if True:
+                create a new task:
+                    add_package_use_mask: upstream_dependency, toggleable_use_flagy
             else:
-                prompt the user regarding a non-optional dependency
-                    if continue:
-                        add the non-optinal dependency to the output file. The user must handle these manually
-                    else:
-                        break and exit, do not perform any changes
-        if ok to continue:
-            for each use flag and upstream package:
-                add the appropriate string to the package.use.mask file
+                check to see if there are additional upstream dependencies on the package
+                if not:
+                    prompt the user: the package:{dependency} depends on {target} and is non toggleable, add this
+                    package to the package.mask file?
+                    if y:
+                        add a new task:
+                            add_package_mask: upstream_dependency
+                    if n:
+                        add to `nonoptional_dependencies`
+                if True:
+                    warn user: the package: {dependency} depends on target and is non toggleable. The package:
+                    {dependency} also has the following reverse dependencies:
+                        - list of dependencies
 
-        add the package to the package.mask file
-        print status
+                    continue?
+                    if True:
+                        add this package to `nonoptional_dependencies` with all of it's reverse dependencies
+                        (recursively call)
+                    if False:
+                        break
+
+        prior to running all tasks, print a summary of what is going to be performed.
+
+        Adding the following to package.use.mask
+          - package.name useflag
+          -
+
+        Adding the following to package.mask
+         - package.name
+
+        Failed to remove the following packages automatically
+        Recommend manual removal:
+         - package.name
+           dependencies
+             - package.name
+             - ..
 
     """
+    orig_package = package
+    nonoptional_dependencies = []
     package_use_masks = []
-    failed_to_remove = []
+    package_masks = []
+    tasks = []
+    messages = {
+        "no_toggle": Template(
+            "the package:$dependency depends on $target and is non toggleable, add this package to the package.mask file?"
+        ),
+        "no_toggle_with_deps": Template(
+            ": the package: $dependency depends on $target and is non toggleable. The package: $dependency also has additional reverse dependencies that cannot be removed automatically - the user will need to manually remove the package - continue?"
+        ),
+        "exit": "user cancelled, no changes made",
+    }
+
     dependencies = equery_depends(package)
     for dependency in dependencies:
-        zprint(dependency, debug=True)
-        dependency_package = dependency.split(" ")[0]
-        deps_with_use_flags = get_dependencies_with_use_flags(dependency)
-        for dep_with_flag in deps_with_use_flags:
-            use_flag = dep_with_flag[0]
-            if use_flag == None:
-                # the dependency is non optional - no use flag
-                ok = prompt_yn(
-                    f"the upstream dependency:{dependency_package} for package: {package} is non optional -- continue?"
-                )
-                if not ok:
-                    zprint("user cancelled - not removing {package}")
-                    sys.exit(1)
-                else:
-                    zprint(
-                        f"continuing removing {package} -- added {dependency_package} to output -- remove manually"
-                    )
-                    failed_to_remove.append(dependency)
-            else:
-                # the dependency has a use flag - add it to tasks
-                TASKS.append(
-                    (
-                        f"add_package_use_mask: {dependency_package}, {use_flag}",
-                        partial(
-                            add_package_use_mask,
-                            package=dependency_package,
-                            use_flag=use_flag,
-                        ),
-                    )
-                )
+        if re.match("virtual.+", dependency):
+            continue
+        p = Package(dependency)
 
-    TASKS.append(
-        (
-            "add_package_mask: {package}",
-            partial(add_package_mask, package=package),
+        pprint.pprint(p.metadata)
+        pprint.pprint(p.get_use_flags())
+        pprint.pprint(p.dependencies)
+        # check to see if the original package can be toggled
+        useflag = p.can_toggle_dependency(orig_package)
+        if useflag:
+            task = Task("pum", package=p.name, useflag=useflag)
+            tasks.append(task)
+            package_use_masks.append((p.name, useflag))
+        else:
+            # check if upstream dependencies
+            subdeps = equery_depends(p.name)
+            proceed = False
+            if not subdeps:
+                proceed = prompt_yn(
+                    messages["no_toggle"].substitute(
+                        dependency=p.name, target=orig_package
+                    )
+                )
+                if proceed:
+                    task = Task("pm", package=p.name)
+                    tasks.append(task)
+                    package_masks.append(p.name)
+                else:
+                    print(messages["exit"])
+                    sys.exit(1)
+            else:
+                proceed = prompt_yn(
+                    messages["no_toggle_with_deps"].substitute(
+                        dependency=p.name, target=orig_package
+                    )
+                )
+                if proceed:
+                    nonoptional_dependencies.append(p.name)
+                else:
+                    print(messages["exit"])
+                    sys.exit(1)
+    proceed = prompt_yn(
+        report.render(
+            original_package=orig_package,
+            package_use_masks=package_use_masks,
+            package_masks=package_masks,
+            nonoptional_dependencies=nonoptional_dependencies,
         )
     )
-    return failed_to_remove
+    if proceed:
+        run_tasks(tasks)
+    else:
+        print(messages["exit"])
 
 
-def run_tasks():
-    global TASKS
+def run_tasks(task_list):
     # make a local copy to add pre-post tasks
-    tasks_ = []
+    from collections import deque
+
+    tasks_ = deque()
     ok = prompt_yn(f"run all tasks to complete removal?")
     if ok:
-        tasks.append(
-            (
-                "make_temp_file",
-                partial(
-                    make_temporary_file,
-                    f"{CHROMEOS_TARGET_PROFILES_ROOT}/package.mask",
-                ),
+        tasks_.appendleft(
+            Task(
+                "mtf",
+                file_=f"{CHROMEOS_TARGET_PROFILES_ROOT}/package.mask",
             )
         )
-        tasks.append(
-            (
-                "make_temp_file",
-                partial(
-                    make_temporary_file,
-                    f"{CHROMEOS_TARGET_PROFILES_ROOT}/package.use.mask",
-                ),
+        tasks_.appendleft(
+            Task(
+                "mtf",
+                file_=f"{CHROMEOS_TARGET_PROFILES_ROOT}/package.use.mask",
             )
         )
-        tasks.extend(TASKS)
-        zprint("running all tasks")
-        for t in tasks:
-            try:
-                zprint(f"running task: {t[0]}")
-                func = t[1]
-                func()
-            except:
-                zprint(
-                    f"an exception occurred while processing all tasks - verify changes to the profiles"
-                )
-                raise
 
-        zprint("removing temporary files and writing changes to profiles")
-        write_temporary_file(f"{CHROMEOS_TARGET_PROFILES_ROOT}/package.mask")
-        write_temporary_file(
-            f"{CHROMEOS_TARGET_PROFILES_ROOT}/package.use.mask"
+        for t in task_list:
+            tasks_.appendleft(t)
+        tasks.appendleft(
+            Task(
+                "wtf",
+                file_=f"{CHROMEOS_TARGET_PROFILES_ROOT}/package.mask",
+            )
         )
-        zprint("completed")
+        tasks.appendleft(
+            Task(
+                "wtf",
+                file_=f"{CHROMEOS_TARGET_PROFILES_ROOT}/package.use.mask",
+            )
+        )
+
+    current = tasks_.pop()
+    while current:
+        current.run_task()
+        current = tasks_.pop()
+
     else:
-        zprint("user cancelled - no changes made")
+        print("user cancelled - no changes made")
+        sys.exit(1)
 
 
 def main(argv: Optional[List[str]]) -> Optional[int]:
@@ -558,9 +694,5 @@ def main(argv: Optional[List[str]]) -> Optional[int]:
     opts = parser.parse_args(argv)
     if opts.verbose:
         DEBUG = True
-    output_file = opts.output
-    deps=equery_depends(opts.package)
-    for d in deps:
-        rev_dep=Package(d)
-        print([str(x) for x in rev_dep.useflags])
+    try_remove_package(opts.package)
 
