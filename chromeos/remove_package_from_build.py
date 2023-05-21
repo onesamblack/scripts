@@ -1,3 +1,4 @@
+ found in the LICENSE file.
 import os
 import sys
 import argparse
@@ -37,18 +38,26 @@ patterns["start_declaration"] = re.compile('[\w\d\-\_]+\+?="')
 patterns["start_quote"] = re.compile('"\s*')
 patterns["end_quote"] = re.compile(r'.*"')
 patterns["depend"] = re.compile('\w*?DEPEND\+?="')
-patterns["flag"] = re.compile("\!?\+?\-?[\w\d\-_]+\??")
+patterns["atom"] = re.compile("^[^\s]+\/[^\s]+$")
+patterns["flag"] = re.compile("^(\!|\+|\-)?[A-Za-z0-9\-_]+\??$")
+patterns["atom_modifiers"] = {}
 patterns["use"] = re.compile("(I|COMMON_)?USE\+?=")
 patterns["toggleable_flag"] = re.compile("[\w\d\-_]+\?")
 patterns["var"] = re.compile("\$\{[\w\d\-\._]+\}")
-patterns["package"] = re.compile("((>=)?[\w\d\.\-]+//?[\w\d\.-]+(:=)?)")
+patterns["package"] = re.compile("((>=)?[\w\d\.\-]+\/?[\w\d\.-]+(:=)?)")
+patterns["atom_modifiers"]"version"]= re.compile("([\-:](\d{1,3})\.?(\d{1,3})?\.?(\d{1,3})?*?)")
+patterns["atom_modifiers"]["slot"]=re.compile("(:\d{1,3}=?)")
+patterns["atom_modifiers"]["subslot"]=re.compile("(:\d{1.3)(?=\/)")
+patterns["atom_modifiers"][["revision"]=re.compile("(\-r[a-zA-Z]*\d?)")
+patterns[["atom_modifiers"]["atom_prefix"]=re.compile("^[\>\=\<]{1,2}")
 patterns["comment"] = re.compile("#.*?$")
-patterns["virtual"] = re.compile("virtual//.+")
+patterns["virtual"] = re.compile("virtual\/.+")
 patterns["inclusive_or"] = re.compile(re.escape("||"))
 patterns["exclusive_or"] = re.compile(re.escape("^^"))
 patterns["at_most"] = re.compile(re.escape("??"))
 
-report = jinja2.Template("""
+report = jinja2.Template(
+    """
 attempting to remove: {[ original_package }}
 
 The following atoms will be added to `package.mask`
@@ -162,15 +171,18 @@ def read_content(filepath):
 def strip_ver_rev(package):
     p = re.sub("\-[\d\.]+\-?_?r?c?p?[0-9A-Za-z]*$", "", package)
     return p.replace(" ", "")
+
+
 def strip_version(dependency):
     d = re.sub("\:\=?.*?$", "", dependency)
     d = re.sub("^\>\=", "", d)
-    d = d.replace(" ","")
+    d = d.replace(" ", "")
     return d
-def strip_qualifiers(flag):
-    f=flag.replace("!","").replace("?","")
-    return f
 
+
+def strip_qualifiers(flag):
+    f = flag.replace("!", "").replace("?", "")
+    return f
 
 
 def tokenize(string):
@@ -252,7 +264,7 @@ def add_package_use_mask(package, use_flag, version=""):
 
 
 class Task:
-    def __init__(self, task,  **kwargs):
+    def __init__(self, task, **kwargs):
         self.task = task
         self.kwargs = kwargs
 
@@ -299,25 +311,73 @@ class UseFlag:
     def match(self, string):
         if re.match(string, self.flag):
             return True
+def get_package_name(package, strip=True, return_filepath=False):
+    package=re.sub("^(\>\=?)?","",package)
+    package=re.sub("(:=)[^\s]*$","",package)
+    package=package.replace(" ", "")
+    
+    print(package)
+    filepath=equery_which(package)
+    if not filepath:
+        if return_filepath:
+            return package, None
+        else:
+            return package
+    dir_, package = os.path.split(filepath)
+    package=package.replace(".ebuild","")
+    if strip:
+        name="/".join(dir_.split("/")[-2:])
+        if return_filepath:
+            return name, filepath
+        else:
+            return name
+    else:
+        if return_filepath:
+            return package, filepath
+        else:
+            return package
 
 
 class Package:
     p_use = re.compile("(I|REQUIRED_)?USE")
-    p_depend = re.compile("(B|C|R|P|COMMON_|[\w_\-]+_)?*DEPEND")
+    p_depend = re.compile("(B|C|R|P|[\w]+)_?(DEP)(END)?")
 
-    def __init__(self, name, filepath=None):
-        self.name = name
-        self.filepath = filepath if filepath else equery_which(name)
+    def __init__(self, name):
+        self.fullname = name
+        short_name, filepath = get_package_name(name, return_filepath=True)
+        self.filepath = filepath
+        # get the name of the package without versioning/revisions
+        dir_=os.path.split(self.filepath)[0]
+        self.name=short_name
         self.dependencies = []
         self.useflags = []
-        self._parse_ebuild()
-    
+        if self.filepath:
+            self._parse_ebuild()
+
     def print_ebuild(self):
-        content=read_content(self.filepath)
+        content = read_content(self.filepath)
         print(content)
 
     def get_use_flags(self):
         return [str(x) for x in self.useflags]
+
+    def get_dependencies(self, return_packages=False):
+        deps= {"nonoptional": []}
+        for d in self.dependencies:
+            if d[0]:
+                if d[0] not in deps.keys():
+                    deps[d[0]] = []
+                if return_packages:
+                    deps[d[0]].append(d[1])
+                else:
+                    deps[d[0]].append(d[1].name)
+            else:
+                if return_packages:
+                    deps[d[0]].append(d[1])
+                else:
+                    deps[d[0]].append(d[1].name)
+
+        return deps       
     def _parse_ebuild(self):
         """
         parses an ebuild file - adds all dependencies
@@ -335,7 +395,9 @@ class Package:
             line = patterns["comment"].sub("", ebuild[i])
             match_sd = patterns["start_declaration"].search(line)
             if match_sd:
-                declaration = match_sd.group(0).replace('="', "").replace("+","")
+                declaration = (
+                    match_sd.group(0).replace('="', "").replace("+", "")
+                )
                 s_idx = i
                 e_idx = i
                 content = patterns["start_declaration"].sub("", line)
@@ -344,25 +406,26 @@ class Package:
                     e_idx += 1
                     content += ebuild[e_idx]
                     match_end = patterns["end_quote"].match(ebuild[e_idx])
-                
+
                 if Package.p_depend.match(declaration):
                     self._set_dependencies(tokenize(content))
-                
+
                 elif Package.p_use.match(declaration):
                     self._set_useflags(tokenize(content))
                 metadata[declaration] = content
         for k, v in metadata.items():
             if k in dir(self):
-                attr=getattr(self,k)
-                attr+=v
-                setattr(self,k,v)
+                attr = getattr(self, k)
+                attr += v
+                setattr(self, k, v)
             else:
                 setattr(self, k, v)
-        self.metadata=metadata
+        self.metadata = metadata
 
     def _add_dependency(self, d):
-        if d[1] not in [x[1] for x in self.dependencies]:
+        if d[1].name not in [x[1].name for x in self.dependencies]:
             self.dependencies.append(d)
+
     def _set_dependencies(self, tokens):
         """
         sets dependencies
@@ -370,69 +433,96 @@ class Package:
         where t[0] is the use flag if the dependency can be toggled in the ebuild, else None
         and t[1] is the dependency
         """
-
+        def _parse_tokens_between_delims(current_index, tokenlist, delims=None):
+            deps=[]
+            end_index=current_index
+            token=tokenlist[current_index]
+            if delims:
+                while token!=delims[0]:
+                    current_index+=1
+                    token=tokenlist[current_index]
+                while token!=delims[1]:
+                    if patterns["flag"].match(token):
+                        flag=strip_qualifiers(token)
+                        deps, e_idx=_parse_tokens_between_delims(current_index, tokenlist, delims=["(",")"]
+                        if deps:
+                            for d in deps:
+                            
+                                dep=Package(_)
+                        dependencies.append((None, dep))
+   
+                                
+            
         dependencies = []
         i = 0
         while i < len(tokens):
-            token=tokens[i]
+            token = tokens[i]
+            print(token)
             if patterns["atom"].match(token):
                 # the token is a non-toggleable dependency
-                dep = strip_version(strip_ver_rev(token))
+                _ = get_package_name(token,strip=False)
+                dep=Package(_)
                 dependencies.append((None, dep))
-            elif patterns["inclusive_or"].match(tokens[i]):
-                token=tokens[i]
+            elif patterns["inclusive_or"].match(token):
                 while token != "(":
-                    i+=1
-                    token=tokens[i]
+                    i += 1
+                    token = tokens[i]
                 while token != ")":
-                    i+=1
-                    token=tokens[i]
-                    if patterns["atom"].match(tokens[i]):
-                        dependencies.append((None,tokens[i]))
-             elif patterns["exclusive_or"].match(tokens[i]):
-                token=tokens[i]
+                    i += 1
+                    token = tokens[i]
+                    if patterns["atom"].match(token):
+                        _ = get_package_name(token,strip=False)
+                        dep=Package(_)
+                        dependencies.append((None, dep))
+            elif patterns["exclusive_or"].match(token):
+                print("or")
                 while token != "(":
-                    i+=1
-                    token=tokens[i]
+                    i += 1
+                    token = tokens[i]
                 while token != ")":
-                    i+=1
-                    token=tokens[i]
-                    if patterns["atom"].match(tokens[i]):
-                        dependencies.append((None,tokens[i]))
-             elif patterns["at_most"].match(tokens[i]):
-                token=tokens[i]
+                    i += 1
+                    token = tokens[i]
+                    if patterns["atom"].match(token):
+                        _ = get_package_name(token,strip=False)
+                        dep=Package(_)
+                        dependencies.append((None, dep))
+            elif patterns["at_most"].match(tokens[i]):
+                print("atmost")
+                token = tokens[i]
                 while token != "(":
-                    i+=1
-                    token=tokens[i]
+                    i += 1
+                    token = tokens[i]
                 while token != ")":
-                    i+=1
-                    token=tokens[i]
-                    if patterns["atom"].match(tokens[i]):
-                        dependencies.append((None,tokens[i]))
+                    i += 1
+                    token = tokens[i]
+                    if patterns["atom"].match(token):
+                        _ = get_package_name(token,strip=False)
+                        dep=Package(_)
+                        dependencies.append((None, dep))
             elif patterns["flag"].match(token):
                 # a flag can be declared with or without parenthesis
                 # e.g. cups? ( net-lib/wireless ) OR
                 # !cups? !package/my-atom:2
                 flag = strip_qualifiers(token)
-                has_paren=True if tokens[i+1] == "(" else False
+                has_paren = True if tokens[i + 1] == "(" else False
                 if has_paren:
                     while token != ")":
-                        i+=1
-                        token=tokens[i]
+                        i += 1
+                        token = tokens[i]
                         if patterns["atom"].match(token):
-                            dep = strip_version(strip_ver_rev(token))
-                            dependencies.append((flag, dep))
-                        
+                            _ = get_package_name(token,strip=False)
+                            dep=Package(_)
+                            dependencies.append((None, dep))
                     for _u in self.useflags:
                         if _u.match(flag):
                             _u.can_toggle()
-                    i += 1
-                    try:
-                        token = tokens[i]
-                    except:
-                        print(f"token out of range: i: {i}")
-                        print(tokens[i-1])
-                        break
+                else:
+                    i+=1
+                    token=tokens[i]
+                    if patterns["atom"].match(token):
+                        _ = get_package_name(token,strip=False)
+                        dep=Package(_)
+                        dependencies.append((None, dep))
             i += 1
         for d in dependencies:
             self._add_dependency(d)
@@ -450,7 +540,7 @@ class Package:
         useflags = []
         i = 0
         while i < len(tokens):
-            token=tokens[i]
+            token = tokens[i]
             if is_flag(tokens[i]):
                 flag = UseFlag(tokens[i])
                 useflags.append(flag)
@@ -468,8 +558,10 @@ class Package:
             self._add_useflag(f)
 
     def can_toggle_dependency(self, dependency):
+        zprint(f"checking {dependency} toggle", debug=True)
         for d in self.dependencies:
-            if strip_version(strip_ver_rev(d[1])) == strip_ver_rev(dependency):
+            zprint(f"{d[1].name}=={strip_ver_rev(dependency)}", debug=True)
+            if d[1].name==strip_ver_rev(dependency):
                 return d[0]
 
 
@@ -494,7 +586,11 @@ def equery_which(package, options=[]):
     if options:
         option_string += " ".join([o for o in options])
     cmd = f"equery -C which {package} {option_string}"
-    res = run_subprocess(cmd)
+    res=None
+    try:
+        res = run_subprocess(cmd)
+    except:
+        zprint(f"no ebuild found for {package}",debug=True)
     if res:
         res = res.replace("\n", "")
     return res
@@ -589,10 +685,9 @@ def try_remove_package(package):
         if re.match("virtual.+", dependency):
             continue
         p = Package(dependency)
-
         pprint.pprint(p.metadata)
         pprint.pprint(p.get_use_flags())
-        pprint.pprint(p.dependencies)
+        pprint.pprint(p.get_dependencies(return_packages=False))
         # check to see if the original package can be toggled
         useflag = p.can_toggle_dependency(orig_package)
         if useflag:
@@ -695,4 +790,3 @@ def main(argv: Optional[List[str]]) -> Optional[int]:
     if opts.verbose:
         DEBUG = True
     try_remove_package(opts.package)
-
