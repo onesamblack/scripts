@@ -1,4 +1,4 @@
- found in the LICENSE file.
+# found in the LICENSE file.
 import os
 import sys
 import argparse
@@ -40,21 +40,27 @@ patterns["end_quote"] = re.compile(r'.*"')
 patterns["depend"] = re.compile('\w*?DEPEND\+?="')
 patterns["atom"] = re.compile("^[^\s]+\/[^\s]+$")
 patterns["flag"] = re.compile("^(\!|\+|\-)?[A-Za-z0-9\-_]+\??$")
-patterns["atom_modifiers"] = {}
 patterns["use"] = re.compile("(I|COMMON_)?USE\+?=")
 patterns["toggleable_flag"] = re.compile("[\w\d\-_]+\?")
 patterns["var"] = re.compile("\$\{[\w\d\-\._]+\}")
 patterns["package"] = re.compile("((>=)?[\w\d\.\-]+\/?[\w\d\.-]+(:=)?)")
-patterns["atom_modifiers"]"version"]= re.compile("([\-:](\d{1,3})\.?(\d{1,3})?\.?(\d{1,3})?*?)")
-patterns["atom_modifiers"]["slot"]=re.compile("(:\d{1,3}=?)")
-patterns["atom_modifiers"]["subslot"]=re.compile("(:\d{1.3)(?=\/)")
-patterns["atom_modifiers"][["revision"]=re.compile("(\-r[a-zA-Z]*\d?)")
-patterns[["atom_modifiers"]["atom_prefix"]=re.compile("^[\>\=\<]{1,2}")
 patterns["comment"] = re.compile("#.*?$")
 patterns["virtual"] = re.compile("virtual\/.+")
 patterns["inclusive_or"] = re.compile(re.escape("||"))
 patterns["exclusive_or"] = re.compile(re.escape("^^"))
 patterns["at_most"] = re.compile(re.escape("??"))
+
+patterns["atom_modifiers"] = {}
+patterns["atom_modifiers"]["version"]=re.compile("([\-](\d{1,3})\.?(\d{1,3})?\.?(\d{1,3})?\*?)")
+patterns["atom_modifiers"]["slot"]=re.compile("(:(\d{1,3})?\=)")
+patterns["atom_modifiers"]["subslot"]=re.compile("(:\d{1.3)(?=\/)")
+patterns["atom_modifiers"]["revision"]=re.compile("([\-_]r[a-zA-Z]*\d*)")
+patterns["atom_modifiers"]["atom_prefix"]=re.compile("^[\>\=\<!]{1,4}")
+patterns["atom_modifiers"]["conditional"]=re.compile("\[.+\]")
+
+patterns["flag_modifiers"]={}
+patterns["flag_modifiers"]["prefix"]=re.compile("^[~\+\-]{1,2}")
+patterns["flag_modifiers"]["optional"]=re.compile("\?$")
 
 report = jinja2.Template(
     """
@@ -133,6 +139,17 @@ def prompt_yn(prompt):
         else:
             print("Invalid input. Please enter 'yes' or 'no'.")
 
+def prompt_selection(selections):
+    num=len(selections)
+    while True
+        print("Choose one of the following")
+        for i,s in enumerate(selections):
+            print(f"{i+1}. {s}")
+        choice=int(input("Choice [0-9]: ")) -1
+        if choice <= num:
+            return selections[choice]
+        else:
+            print("Invalid selection")
 
 def get_temporary_filehandle(file_):
     fullpath_ = os.path.abspath(file_)
@@ -167,22 +184,6 @@ def read_content(filepath):
         content += fh.read()
     return content
 
-
-def strip_ver_rev(package):
-    p = re.sub("\-[\d\.]+\-?_?r?c?p?[0-9A-Za-z]*$", "", package)
-    return p.replace(" ", "")
-
-
-def strip_version(dependency):
-    d = re.sub("\:\=?.*?$", "", dependency)
-    d = re.sub("^\>\=", "", d)
-    d = d.replace(" ", "")
-    return d
-
-
-def strip_qualifiers(flag):
-    f = flag.replace("!", "").replace("?", "")
-    return f
 
 
 def tokenize(string):
@@ -279,24 +280,67 @@ class Task:
             write_temporary_file(self.kwargs["file_"])
 
 
+def get_atom_name(package_str, 
+                  filepath=False):
+    package={}
+    package={"fullname": package_str}
+    for k,v  in patterns["atom_modifiers"].items():
+        try:
+            _m=v.search(package_str)
+        except:
+            print(package_str)
+            raise
+        if _m:
+            package_str=re.sub(v,"",package_str)
+            package[k]=_m.group(0)
+    package["atom"]=package_str
+    if filepath:
+        path=equery_which(package_str)
+        return package, path
+    else:
+        return package
+
+def get_flag_name(flag_str):
+    flag={}
+    flag["full"]=flag_str
+    for k,v in patterns["flag_modifiers"].items():
+        _m=v.search(flag_str)
+        if _m:
+            flag_str=re.sub(v,"",flag_str)
+            if k == "optional":
+                flag[k]=True
+            else:
+                flag[k]=_m.group(0)
+    flag["name"]=flag_str
+    return flag
+
 class UseFlag:
     def __init__(self, flag):
-        self.flag = re.sub("[+-]", "", flag)
-        flag = list(flag)
-        self.enabled = True if flag[0] == "+" else False
-        self.disabled = True if flag[0] == "-" else False
+        flag=get_flag_name(flag)
+        self.name=flag.get("name")
+        self.optional=flag.get("optional")
+        prefix=flag.get("prefix",[])
+        self.original=flag.get("full")
+        if prefix:
+            prefix=list(prefix)    
+        self.enabled = True if "+" in prefix else False
+        self.disabled = True if "-" in prefix  else False
+        self.testing = True if "~" in prefix else False
         self.default = True if not any([self.enabled, self.disabled]) else False
-        self.toggle = False
+        self.toggle = True if self.optional else False
+        self.condition = ""
+
+    def set_condition(self, condition):
+        """
+        a useflag can be set as the state of another useflag
+
+        e.g. if useflag1? ( -useflag2 )
+        """
+        self.condition=condition
+
 
     def __str__(self):
-        flag = f"{self.flag}"
-        if self.toggle:
-            flag = f"{flag}?"
-        if self.enabled:
-            flag = f"+{flag}"
-        if self.disabled:
-            flag = f"-{flag}"
-        return flag
+        return self.original
 
     def can_toggle(self):
         """
@@ -309,51 +353,27 @@ class UseFlag:
         self.toggle = True
 
     def match(self, string):
-        if re.match(string, self.flag):
+        if re.match(string, self.name):
             return True
-def get_package_name(package, strip=True, return_filepath=False):
-    package=re.sub("^(\>\=?)?","",package)
-    package=re.sub("(:=)[^\s]*$","",package)
-    package=package.replace(" ", "")
-    
-    print(package)
-    filepath=equery_which(package)
-    if not filepath:
-        if return_filepath:
-            return package, None
-        else:
-            return package
-    dir_, package = os.path.split(filepath)
-    package=package.replace(".ebuild","")
-    if strip:
-        name="/".join(dir_.split("/")[-2:])
-        if return_filepath:
-            return name, filepath
-        else:
-            return name
-    else:
-        if return_filepath:
-            return package, filepath
-        else:
-            return package
 
 
 class Package:
     p_use = re.compile("(I|REQUIRED_)?USE")
     p_depend = re.compile("(B|C|R|P|[\w]+)_?(DEP)(END)?")
 
-    def __init__(self, name):
+    def __init__(self, name, parse_ebuild=False):
         self.fullname = name
-        short_name, filepath = get_package_name(name, return_filepath=True)
+        package, filepath=get_atom_name(name, filepath=True)
         self.filepath = filepath
         # get the name of the package without versioning/revisions
-        dir_=os.path.split(self.filepath)[0]
-        self.name=short_name
+        self.name=package["atom"]
         self.dependencies = []
         self.useflags = []
-        if self.filepath:
+        self.metadata = None
+        if not self.filepath:
+            return
+        if self.filepath is not None and parse_ebuild:
             self._parse_ebuild()
-
     def print_ebuild(self):
         content = read_content(self.filepath)
         print(content)
@@ -363,19 +383,20 @@ class Package:
 
     def get_dependencies(self, return_packages=False):
         deps= {"nonoptional": []}
+        print(self.dependencies)
         for d in self.dependencies:
-            if d[0]:
-                if d[0] not in deps.keys():
-                    deps[d[0]] = []
+            if d.useflag:
+                if d.useflag.name  not in deps.keys():
+                    deps[d.useflag.name] = []
                 if return_packages:
-                    deps[d[0]].append(d[1])
+                    deps[d.useflag.name].append(d)
                 else:
-                    deps[d[0]].append(d[1].name)
+                    deps[d.useflag.name].append(d.name)
             else:
                 if return_packages:
-                    deps[d[0]].append(d[1])
+                    deps["nonoptional"].append(d)
                 else:
-                    deps[d[0]].append(d[1].name)
+                    deps["nonoptional"].append(d.name)
 
         return deps       
     def _parse_ebuild(self):
@@ -388,8 +409,11 @@ class Package:
         rather than use the built in `equery` tool, this reads the content directly and uses
         regex to parse the pattern
         """
-        ebuild = read_content(self.filepath).replace("\t", " ").split("\n")
+        ebuild_raw = read_content(self.filepath).replace("\t", " ")
+        ebuild=ebuild_raw.split)("\n")
         metadata = {}
+    }
+        
         for i in range(0, len(ebuild)):
             # filter comments
             line = patterns["comment"].sub("", ebuild[i])
@@ -408,10 +432,16 @@ class Package:
                     match_end = patterns["end_quote"].match(ebuild[e_idx])
 
                 if Package.p_depend.match(declaration):
-                    self._set_dependencies(tokenize(content))
-
+                    i, tokens, e =self._set_dependencies(tokenize(content))
+                    if e:
+                        print(i)
+                        print(tokens)
+                        print(e)
                 elif Package.p_use.match(declaration):
-                    self._set_useflags(tokenize(content))
+                    if declaration=="REQUIRED_USE":
+                        self._set_required_use(tokenize(content))
+                    else:
+                        self._set_useflags(tokenize(content))
                 metadata[declaration] = content
         for k, v in metadata.items():
             if k in dir(self):
@@ -423,7 +453,7 @@ class Package:
         self.metadata = metadata
 
     def _add_dependency(self, d):
-        if d[1].name not in [x[1].name for x in self.dependencies]:
+        if d.name not in [x.name for x in self.dependencies]:
             self.dependencies.append(d)
 
     def _set_dependencies(self, tokens):
@@ -432,123 +462,118 @@ class Package:
 
         where t[0] is the use flag if the dependency can be toggled in the ebuild, else None
         and t[1] is the dependency
-        """
-        def _parse_tokens_between_delims(current_index, tokenlist, delims=None):
-            deps=[]
-            end_index=current_index
-            token=tokenlist[current_index]
-            if delims:
-                while token!=delims[0]:
-                    current_index+=1
-                    token=tokenlist[current_index]
-                while token!=delims[1]:
-                    if patterns["flag"].match(token):
-                        flag=strip_qualifiers(token)
-                        deps, e_idx=_parse_tokens_between_delims(current_index, tokenlist, delims=["(",")"]
-                        if deps:
-                            for d in deps:
-                            
-                                dep=Package(_)
-                        dependencies.append((None, dep))
-   
-                                
-            
+    
+        """        
         dependencies = []
         i = 0
-        while i < len(tokens):
-            token = tokens[i]
-            print(token)
-            if patterns["atom"].match(token):
-                # the token is a non-toggleable dependency
-                _ = get_package_name(token,strip=False)
-                dep=Package(_)
-                dependencies.append((None, dep))
-            elif patterns["inclusive_or"].match(token):
-                while token != "(":
-                    i += 1
-                    token = tokens[i]
-                while token != ")":
-                    i += 1
-                    token = tokens[i]
-                    if patterns["atom"].match(token):
-                        _ = get_package_name(token,strip=False)
-                        dep=Package(_)
-                        dependencies.append((None, dep))
-            elif patterns["exclusive_or"].match(token):
-                print("or")
-                while token != "(":
-                    i += 1
-                    token = tokens[i]
-                while token != ")":
-                    i += 1
-                    token = tokens[i]
-                    if patterns["atom"].match(token):
-                        _ = get_package_name(token,strip=False)
-                        dep=Package(_)
-                        dependencies.append((None, dep))
-            elif patterns["at_most"].match(tokens[i]):
-                print("atmost")
+        try:
+            while i < len(tokens):
                 token = tokens[i]
-                while token != "(":
-                    i += 1
-                    token = tokens[i]
-                while token != ")":
-                    i += 1
-                    token = tokens[i]
-                    if patterns["atom"].match(token):
-                        _ = get_package_name(token,strip=False)
-                        dep=Package(_)
-                        dependencies.append((None, dep))
-            elif patterns["flag"].match(token):
-                # a flag can be declared with or without parenthesis
-                # e.g. cups? ( net-lib/wireless ) OR
-                # !cups? !package/my-atom:2
-                flag = strip_qualifiers(token)
-                has_paren = True if tokens[i + 1] == "(" else False
-                if has_paren:
+                if patterns["atom"].match(token):
+                    # the token is a non-toggleable dependency
+                    _ = get_atom_name(token)["atom"]
+                    dep=Dependency(_, self)
+                    dependencies.append(dep)
+                elif patterns["inclusive_or"].match(token):
+                    while token != "(":
+                        token = tokens[i]
+                        i+=1
+                    while token != ")":
+                        token = tokens[i]
+                        i+=1
+                        if patterns["atom"].match(token):
+                            _ = get_atom_name(token)["atom"]
+                            dep=Dependency(_, self)
+                            dependencies.append(dep)
+                elif patterns["exclusive_or"].match(token):
+                    while token != "(":
+                        i += 1
+                        token = tokens[i]
                     while token != ")":
                         i += 1
                         token = tokens[i]
                         if patterns["atom"].match(token):
-                            _ = get_package_name(token,strip=False)
-                            dep=Package(_)
-                            dependencies.append((None, dep))
-                    for _u in self.useflags:
-                        if _u.match(flag):
-                            _u.can_toggle()
-                else:
-                    i+=1
-                    token=tokens[i]
-                    if patterns["atom"].match(token):
-                        _ = get_package_name(token,strip=False)
-                        dep=Package(_)
-                        dependencies.append((None, dep))
-            i += 1
-        for d in dependencies:
-            self._add_dependency(d)
+                            _ = get_atom_name(token)["atom"]
+                            dep=Dependency(_, self)
+                            dependencies.append(dep)
+                elif patterns["at_most"].match(tokens[i]):
+                    token = tokens[i]
+                    while token != "(":
+                        i += 1
+                        token = tokens[i]
+                    while token != ")":
+                        i += 1
+                        token = tokens[i]
+                        if patterns["atom"].match(token):
+                            _ = get_atom_name(token)["atom"]
+                            dep=Dependency(_, self)
+                            dependencies.append(dep)
+                elif patterns["flag"].match(token):
+                    # a flag can be declared with or without parenthesis
+                    # e.g. cups? ( net-lib/wireless ) OR
+                    # !cups? !package/my-atom:2
+                    # or nested
+                    # flag? (
+                    #   flag2? (
+                    #       >=blah
+                    #    )
+                    #)
+                    flag = UseFlag(token)
+                    if tokens[i+1] < len(tokens):
+                        i+=1
+                        if token == "(":
+                            while token != ")":
+                                i+1
+                                token=tokens[i]
+                                if self._is_useflag(token):
+                                    subflag=UseFlag(token)
+                                    if tokens[i+1] < len(tokens):
+                                        i+1
+                                        subtoken=tokens[i]
+                                        if subtoken == "(":
+                                            while subtoken != ")":
+                                                i+1
+                                                subtoken=tokens[i]
+                                                if patterns["atom"].match(subtoken):
+                                                    _ = get_atom_name(subtoken)["atom"]
+                                                    dep=Dependency(_, self, useflag=subflag)
+                                                    dependencies.append(dep)
+                                elif patterns["atom"].match(token):
+                                    _ = get_atom_name(token)["atom"]
+                                    dep=Dependency(_,self,useflag=flag)
+                                    dependencies.append(dep)
 
+
+                i += 1
+            for d in dependencies:
+                if d.useflag:
+                    self._add_useflag(d.useflag)         
+                self._add_dependency(d)
+
+        except Exception as e: 
+            return (i, tokens, e)
+    
+        finally:
+            return (None, None,  None)
     def _add_useflag(self, useflag):
-        if not useflag.flag in [x.flag for x in self.useflags]:
+        if not useflag.name in [x.name for x in self.useflags]:
             self.useflags.append(useflag)
+        return useflag
 
     def _set_useflags(self, tokens):
-        def is_flag(token):
-            match = patterns["flag"].match(token)
-            if match:
-                return True
 
         useflags = []
         i = 0
         while i < len(tokens):
             token = tokens[i]
-            if is_flag(tokens[i]):
-                flag = UseFlag(tokens[i])
+            if self._is_flag(token):
+                flag = UseFlag(token)
                 useflags.append(flag)
             elif tokens[i] == "(":
                 i += 1
                 token = tokens[i]
                 while token != ")":
-                    if is_flag(token):
+                    if self._is_flag(token):
                         flag = UseFlag(token)
                         useflags.append(flag)
                     i += 1
@@ -557,12 +582,70 @@ class Package:
         for f in useflags:
             self._add_useflag(f)
 
-    def can_toggle_dependency(self, dependency):
-        zprint(f"checking {dependency} toggle", debug=True)
-        for d in self.dependencies:
-            zprint(f"{d[1].name}=={strip_ver_rev(dependency)}", debug=True)
-            if d[1].name==strip_ver_rev(dependency):
-                return d[0]
+    def _get_flag(self, flag_str):
+        f = get_flag_name(flag_str)["name"]
+        for i,_f in enumerate(self.useflags):
+            if _f.name==f:
+                flag=self.useflags[i]
+                return flag
+        return UseFlag(flag_str)
+    @staticmethod
+    def _is_flag(flag_str):
+        if patterns["flag"].match(flag_str):
+            return True
+            
+    def _set_required_use(self, tokens):
+        useflags = []
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if  self._is_flag(token):
+                flag = self._get_flag(token)
+                useflags.append(flag)
+            if token == "(":
+                while token != ")":
+                    i+=1
+                    token=tokens[i]
+                    if self._is_flag(token):
+                        flag=self._get_flag(token)
+                        useflags.append(flag)
+            i += 1
+        for f in useflags:
+            self._add_useflag(f)
+
+class Dependency(Package):
+    def __init__(self, name, parent=None, useflag=None, parse_ebuild=False):
+        super().__init__(name, parse_ebuild=parse_ebuild)
+        self.parent=parent
+        self.useflag=useflag
+
+    def add_useflag(self, useflag):
+        self.useflag = useflag
+
+    def __str__(self):
+        if self.is_toggleable:
+            return f"{parent.name} -> self.name, toggle:{self.useflag.flag}"
+        else:
+            return f"{parent.name} -> self.name (nontoggleable)"
+    def is_toggleable(self):
+        return True if self.useflag else False
+
+class Task:
+    def __init__(self, task, **kwargs):
+        self.task = task
+        self.kwargs = kwargs
+
+    def run_task(self):
+        if self.task == "pm":
+            add_package_mask(self.kwargs["package"])
+        if self.task == "pum":
+            add_package_use_mask(self.kwargs["package"], self.kwargs["useflag"])
+        if self.task == "mtf":
+            make_temporary_file(self.kwargs["file_"])
+        if self.task == "wtf":
+            write_temporary_file(self.kwargs["file_"])
+
+
 
 
 def equery_use(package, options=[]):
@@ -591,10 +674,27 @@ def equery_which(package, options=[]):
         res = run_subprocess(cmd)
     except:
         zprint(f"no ebuild found for {package}",debug=True)
+        zprint(f"searching for {package}",debug=True)
+        
+
     if res:
         res = res.replace("\n", "")
     return res
 
+def equery_list(package, options=[]):
+    option_string = ""
+    if options:
+        option_string += " ".join([o for o in options])
+    cmd = f"equery list -f {package}"
+    res=[]
+    try:
+        res = run_subprocess(cmd)
+    except:
+        zprint(f"no ebuilds found for {package}",debug=True)
+    if res:
+        res = res.replace("\n", "")
+        res = [r for r in res.split(" ")]
+    return res
 
 def equery_depends(package, options=[]):
     option_string = ""
@@ -609,7 +709,8 @@ def equery_depends(package, options=[]):
 
     if res:
         deps = set()
-        for x in [strip_ver_rev(x) for x in res.split("\n")]:
+
+        for x in [get_atom_name(x)["atom"] for x in res.split("\n")]:
             if x != "":
                 deps.add(x)
         return deps
@@ -679,46 +780,45 @@ def try_remove_package(package):
         ),
         "exit": "user cancelled, no changes made",
     }
-
-    dependencies = equery_depends(package)
+    dependencies=equery_depends(package)
     for dependency in dependencies:
-        if re.match("virtual.+", dependency):
-            continue
-        p = Package(dependency)
-        pprint.pprint(p.metadata)
-        pprint.pprint(p.get_use_flags())
-        pprint.pprint(p.get_dependencies(return_packages=False))
+        d_name=get_atom_name(dependency)["atom"]
+        
+        d=Dependency(d_name, parse_ebuild=True)
+        pprint.pprint(d.metadata)
+        pprint.pprint(d.get_use_flags())
+        pprint.pprint(d.get_dependencies(return_packages=False))
         # check to see if the original package can be toggled
-        useflag = p.can_toggle_dependency(orig_package)
-        if useflag:
-            task = Task("pum", package=p.name, useflag=useflag)
+        useflag = d.useflag
+        if useflag and useflag.optional:
+            task = Task("pum", package=d.name, useflag=useflag.name)
             tasks.append(task)
-            package_use_masks.append((p.name, useflag))
+            package_use_masks.append((d.name, useflag))
         else:
             # check if upstream dependencies
-            subdeps = equery_depends(p.name)
+            subdeps = equery_depends(d.name)
             proceed = False
             if not subdeps:
                 proceed = prompt_yn(
                     messages["no_toggle"].substitute(
-                        dependency=p.name, target=orig_package
+                        dependency=d.name, target=orig_package
                     )
                 )
                 if proceed:
-                    task = Task("pm", package=p.name)
+                    task = Task("pm", package=d.name)
                     tasks.append(task)
-                    package_masks.append(p.name)
+                    package_masks.append(d.name)
                 else:
                     print(messages["exit"])
                     sys.exit(1)
             else:
                 proceed = prompt_yn(
                     messages["no_toggle_with_deps"].substitute(
-                        dependency=p.name, target=orig_package
+                        dependency=d.name, target=orig_package
                     )
                 )
                 if proceed:
-                    nonoptional_dependencies.append(p.name)
+                    nonoptional_dependencies.append(d.name)
                 else:
                     print(messages["exit"])
                     sys.exit(1)
@@ -790,3 +890,4 @@ def main(argv: Optional[List[str]]) -> Optional[int]:
     if opts.verbose:
         DEBUG = True
     try_remove_package(opts.package)
+
