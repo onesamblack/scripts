@@ -890,4 +890,3 @@ def main(argv: Optional[List[str]]) -> Optional[int]:
     if opts.verbose:
         DEBUG = True
     try_remove_package(opts.package)
-
